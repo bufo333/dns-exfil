@@ -1,0 +1,4 @@
+**/output
+*.exe
+*.key
+.env
