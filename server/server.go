@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
 	"flag"
@@ -18,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/miekg/dns"
 	"golang.org/x/crypto/hkdf"
 )
@@ -34,51 +34,42 @@ type sharedKey struct {
 	hmacKey []byte
 }
 
+type rateLimitEntry struct {
+	timestamps []time.Time
+}
+
 type Server struct {
-	domain     string
-	outputDir  string
-	privKey    *ecdh.PrivateKey
-	pubKeyB32  string
-	fragments  map[string]map[int]string
-	lastSeen   map[string]time.Time
-	sharedKeys map[string]sharedKey
-	keyBuffers map[string][]string
-	mu         sync.Mutex
+	domain         string
+	outputDir      string
+	fragments      map[string]map[int]string
+	lastSeen       map[string]time.Time
+	sharedKeys     map[string]sharedKey
+	serverPubkeys  map[string][]byte
+	mu             sync.Mutex
+	rateLimitMu    sync.Mutex
+	ipRequests     map[string]*rateLimitEntry
+	rateLimitWindow time.Duration
+	rateLimitMax   int
 }
 
 func main() {
-	_ = godotenv.Load()
-
 	port := flag.Int("port", 5300, "UDP port to listen on")
 	domain := flag.String("domain", "xf.example.com", "Delegated DNS domain")
 	outDir := flag.String("output-dir", "output", "Directory to write output files")
-	privPath := flag.String("server-key", os.Getenv("SERVER_PRIVATE_KEY"), "Path to X25519 private key file")
-	pubPath := flag.String("server-pubkey", os.Getenv("SERVER_PUBLIC_KEY"), "Path to X25519 public key file")
+	rlWindow := flag.Int("rate-limit-window", 60, "Rate limit window in seconds")
+	rlMax := flag.Int("rate-limit-max", 200, "Max requests per IP per window")
 	flag.Parse()
 
-	if *privPath == "" || *pubPath == "" {
-		log.Fatal("server-key and server-pubkey must be provided")
-	}
-
-	privKey, err := loadPrivateKey(*privPath)
-	if err != nil {
-		log.Fatalf("failed to load private key: %v", err)
-	}
-
-	pubB32, err := loadPublicKeyB32(*pubPath)
-	if err != nil {
-		log.Fatalf("failed to load public key: %v", err)
-	}
-
 	srv := &Server{
-		domain:     *domain,
-		outputDir:  *outDir,
-		privKey:    privKey,
-		pubKeyB32:  pubB32,
-		fragments:  make(map[string]map[int]string),
-		lastSeen:   make(map[string]time.Time),
-		sharedKeys: make(map[string]sharedKey),
-		keyBuffers: make(map[string][]string),
+		domain:          *domain,
+		outputDir:       *outDir,
+		fragments:       make(map[string]map[int]string),
+		lastSeen:        make(map[string]time.Time),
+		sharedKeys:      make(map[string]sharedKey),
+		serverPubkeys:   make(map[string][]byte),
+		ipRequests:      make(map[string]*rateLimitEntry),
+		rateLimitWindow: time.Duration(*rlWindow) * time.Second,
+		rateLimitMax:    *rlMax,
 	}
 
 	go srv.cleanupStale()
@@ -93,27 +84,33 @@ func main() {
 	}
 }
 
-// loadPrivateKey reads an X25519 private key from file.
-func loadPrivateKey(path string) (*ecdh.PrivateKey, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read private key %q: %w", path, err)
-	}
-	return ecdh.X25519().NewPrivateKey(data)
-}
+// isRateLimited checks whether the given IP has exceeded the request limit.
+func (s *Server) isRateLimited(ip string) bool {
+	now := time.Now()
+	s.rateLimitMu.Lock()
+	defer s.rateLimitMu.Unlock()
 
-// loadPublicKeyB32 reads an X25519 public key and returns its Base32 encoding.
-func loadPublicKeyB32(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read public key %q: %w", path, err)
+	entry, ok := s.ipRequests[ip]
+	if !ok {
+		entry = &rateLimitEntry{}
+		s.ipRequests[ip] = entry
 	}
-	pub, err := ecdh.X25519().NewPublicKey(data)
-	if err != nil {
-		return "", fmt.Errorf("parse public key: %w", err)
+
+	// Prune old timestamps
+	cutoff := now.Add(-s.rateLimitWindow)
+	fresh := entry.timestamps[:0]
+	for _, t := range entry.timestamps {
+		if t.After(cutoff) {
+			fresh = append(fresh, t)
+		}
 	}
-	b32 := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(pub.Bytes())
-	return b32, nil
+	entry.timestamps = fresh
+
+	if len(entry.timestamps) >= s.rateLimitMax {
+		return true
+	}
+	entry.timestamps = append(entry.timestamps, now)
+	return false
 }
 
 // ServeDNS handles incoming DNS requests.
@@ -123,6 +120,14 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	// Rate limiting
+	if addr, ok := w.RemoteAddr().(*net.UDPAddr); ok {
+		if s.isRateLimited(addr.IP.String()) {
+			log.Printf("Rate limit exceeded for %s, dropping request", addr.IP)
+			return
+		}
+	}
+
 	q := r.Question[0]
 	qname := strings.TrimSuffix(q.Name, ".")
 	if !strings.HasSuffix(strings.ToLower(qname), strings.ToLower(s.domain)) {
@@ -130,32 +135,10 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	expected := fmt.Sprintf("public.%s", s.domain)
 	reply := new(dns.Msg)
 	reply.SetReply(r)
 
-	if strings.EqualFold(qname, expected) {
-		if q.Qtype == dns.TypeTXT {
-			reply.Answer = append(reply.Answer, &dns.TXT{
-				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
-				Txt: []string{s.pubKeyB32},
-			})
-		} else {
-			sans := &dns.SOA{
-				Hdr:    dns.RR_Header{Name: s.domain + ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 300},
-				Ns:     "ns1." + s.domain + ".",
-				Mbox:   "hostmaster." + s.domain + ".",
-				Serial: 1, Refresh: 3600, Retry: 900, Expire: 604800, Minttl: 86400,
-			}
-			reply.Ns = append(reply.Ns, sans)
-		}
-		if err := w.WriteMsg(reply); err != nil {
-			log.Printf("failed to write TXT response: %v", err)
-		}
-		return
-	}
-
-	// handle key exchange or data chunk
+	// Parse subdomain: <id>-<idx>-<total>-<payload>[.<more>...].<domain>
 	prefix := qname[:len(qname)-len(s.domain)-1]
 	parts := strings.SplitN(prefix, "-", 4)
 	if len(parts) != 4 {
@@ -164,46 +147,72 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	id, idx, total, payload := parts[0], parts[1], parts[2], parts[3]
 
 	if idx == "0" && total == "0" {
-		s.handleKeyExchange(id, payload)
+		// Key exchange: client sends pubkey via TXT query, server responds with TXT
+		serverPubBytes := s.handleKeyExchange(id, payload)
+		if serverPubBytes == nil {
+			return
+		}
+		serverPubB32 := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(serverPubBytes)
+		reply.Answer = append(reply.Answer, &dns.TXT{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 0},
+			Txt: []string{serverPubB32},
+		})
 	} else {
+		// Data chunk
 		s.handleDataChunk(id, idx, total, payload)
+		reply.Answer = append(reply.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
+			A:   net.ParseIP("192.0.2.1"),
+		})
 	}
 
-	// A-record ACK
-	reply.Answer = append(reply.Answer, &dns.A{
-		Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
-		A:   net.ParseIP("192.0.2.1"),
-	})
 	if err := w.WriteMsg(reply); err != nil {
-		log.Printf("failed to write A response for %s: %v", q.Name, err)
+		log.Printf("failed to write response for %s: %v", q.Name, err)
 	}
 }
 
-// handleKeyExchange collects fragments of the client's public key.
-func (s *Server) handleKeyExchange(id, fragment string) bool {
+// handleKeyExchange generates an ephemeral server keypair for this session,
+// derives shared keys, and returns the server's ephemeral public key bytes.
+// Idempotent: if session already has keys, returns cached server pubkey.
+func (s *Server) handleKeyExchange(id, payload string) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.keyBuffers[id] = append(s.keyBuffers[id], strings.Split(fragment, ".")...)
-	b32 := strings.Join(s.keyBuffers[id], "")
-	if len(b32) < 52 {
-		return false
+	// Idempotent: return cached pubkey if session already established
+	if pub, ok := s.serverPubkeys[id]; ok {
+		return pub
 	}
+
+	// Join multi-label payload (dots from additional labels)
+	b32 := strings.ReplaceAll(payload, ".", "")
 	padded := padBase32String(b32)
-	raw, err := base32.StdEncoding.DecodeString(padded)
+	clientPubBytes, err := base32.StdEncoding.DecodeString(padded)
 	if err != nil {
 		log.Printf("[%s] Base32 decode failed: %v", id, err)
-		return false
+		return nil
 	}
-	aesKey, hmacKey, err := deriveSharedKey(s.privKey, raw)
+
+	// Generate ephemeral server keypair
+	curve := ecdh.X25519()
+	serverPriv, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Printf("[%s] generate server key: %v", id, err)
+		return nil
+	}
+	serverPubBytes := serverPriv.PublicKey().Bytes()
+
+	// Derive shared keys
+	aesKey, hmacKey, err := deriveSharedKey(serverPriv, clientPubBytes)
 	if err != nil {
 		log.Printf("[%s] deriveSharedKey error: %v", id, err)
-		return false
+		return nil
 	}
+
 	s.sharedKeys[id] = sharedKey{aesKey, hmacKey}
+	s.serverPubkeys[id] = serverPubBytes
 	s.lastSeen[id] = time.Now()
-	log.Printf("[%s] Session keys established", id)
-	return true
+	log.Printf("[%s] Ephemeral session keys established", id)
+	return serverPubBytes
 }
 
 // handleDataChunk stores chunk and processes when complete.
@@ -334,7 +343,7 @@ func (s *Server) cleanupStale() {
 			if now.Sub(ts) > sessionTTL {
 				delete(s.fragments, id)
 				delete(s.sharedKeys, id)
-				delete(s.keyBuffers, id)
+				delete(s.serverPubkeys, id)
 				delete(s.lastSeen, id)
 				log.Printf("[%s] Session expired and cleaned up", id)
 			}
